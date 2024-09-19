@@ -1,8 +1,6 @@
 module github.com/Mellanox/network-operator
 
-go 1.22
-
-toolchain go1.22.4
+go 1.22.4
 
 require (
 	github.com/Masterminds/semver/v3 v3.3.0
