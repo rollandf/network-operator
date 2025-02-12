@@ -506,9 +506,12 @@ func renderObjects(ctx context.Context, nodePool *nodeinfo.NodePool, useDtk bool
 	clusterInfo clustertype.Provider, docaProvider docadriverimages.Provider) ([]*unstructured.Unstructured, error) {
 	precompiledTag := fmt.Sprintf(precompiledTagFormat, cr.Spec.OFEDDriver.Version, nodePool.Kernel,
 		nodePool.OsName, nodePool.OsVersion, nodePool.Arch)
-	precompiledExists := docaProvider.TagExists(precompiledTag)
+	precompiledExists, err := docaProvider.TagExists(precompiledTag)
 	reqLogger.V(consts.LogLevelDebug).Info("Precompiled tag", "tag:", precompiledTag, "found:", precompiledExists)
 	if !precompiledExists && cr.Spec.OFEDDriver.ForcePrecompiled {
+		if err != nil {
+			return nil, fmt.Errorf("fail to check precompiled tag: %v", err)
+		}
 		return nil, fmt.Errorf("ForcePrecompiled is enabled and precompiled tag was not found: %s", precompiledTag)
 	}
 
@@ -533,7 +536,7 @@ func renderObjects(ctx context.Context, nodePool *nodeinfo.NodePool, useDtk bool
 	osname := nodePool.OsName
 
 	// set any custom ssl key/certificate configuration provided
-	err := s.handleCertConfig(ctx, cr, osname, &additionalVolMounts)
+	err = s.handleCertConfig(ctx, cr, osname, &additionalVolMounts)
 	if err != nil {
 		return nil, err
 	}

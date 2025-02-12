@@ -74,10 +74,11 @@ func (d *openShiftClusterProvider) IsOpenshift() bool {
 
 type dummyOfedImageProvider struct {
 	tagExists bool
+	lastError error
 }
 
-func (d *dummyOfedImageProvider) TagExists(_ string) bool {
-	return d.tagExists
+func (d *dummyOfedImageProvider) TagExists(_ string) (bool, error) {
+	return d.tagExists, d.lastError
 }
 
 func (d *dummyOfedImageProvider) SetImageSpec(*v1alpha1.ImageSpec) {}
