@@ -59,8 +59,8 @@ var k8sManagerCancelFn context.CancelFunc
 type mockImageProvider struct {
 }
 
-func (d *mockImageProvider) TagExists(_ string) bool {
-	return false
+func (d *mockImageProvider) TagExists(_ string) (bool, error) {
+	return false, nil
 }
 
 func (d *mockImageProvider) SetImageSpec(*mellanoxcomv1alpha1.ImageSpec) {}

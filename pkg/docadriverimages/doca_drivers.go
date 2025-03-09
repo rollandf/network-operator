@@ -42,7 +42,7 @@ import (
 // Provider provides interface to check the DOCA driver images
 type Provider interface {
 	// TagExists returns true if DOCA driver image with provided tag exists
-	TagExists(tag string) bool
+	TagExists(tag string) (bool, error)
 	// SetImageSpec sets the Container registry details
 	SetImageSpec(*mellanoxv1alpha1.ImageSpec)
 }
@@ -69,18 +69,22 @@ type provider struct {
 	docaImageSpec *mellanoxv1alpha1.ImageSpec
 	ctx           context.Context
 	mu            sync.Mutex
+	lastError     error
 }
 
 // TagExists returns true if DOCA driver image with provided tag exists
-func (p *provider) TagExists(tag string) bool {
+func (p *provider) TagExists(tag string) (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.lastError != nil {
+		return false, p.lastError
+	}
 	for _, t := range p.tags {
 		if t == tag {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // SetImageSpec sets the Container registry details
@@ -110,6 +114,7 @@ func (p *provider) retrieveTags() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	logger := log.FromContext(p.ctx)
+	p.lastError = nil
 	logger.Info("fetching DOCA driver image tags", "repo", p.docaImageSpec.Repository, "image", p.docaImageSpec.Image)
 	pullSecrets := make([]corev1.Secret, 0)
 	for _, name := range p.docaImageSpec.ImagePullSecrets {
@@ -121,6 +126,7 @@ func (p *provider) retrieveTags() {
 		if errors.IsNotFound(err) {
 			continue
 		} else if err != nil {
+			p.lastError = err
 			logger.Error(err, "failed to get pull secret")
 			return
 		}
@@ -128,17 +134,20 @@ func (p *provider) retrieveTags() {
 	}
 	auth, err := kauth.NewFromPullSecrets(p.ctx, pullSecrets)
 	if err != nil {
+		p.lastError = err
 		logger.Error(err, "failed to create registry auth from secrets")
 		return
 	}
 	image := fmt.Sprintf("%s/%s", p.docaImageSpec.Repository, p.docaImageSpec.Image)
 	repo, err := name.NewRepository(image)
 	if err != nil {
+		p.lastError = err
 		logger.Error(err, "failed to create repo")
 		return
 	}
 	tags, err := remote.List(repo, remote.WithAuthFromKeychain(auth))
 	if err != nil {
+		p.lastError = err
 		logger.Error(err, "failed to list tags")
 		return
 	}
