@@ -63,8 +63,7 @@ spec:
           {{- else }}
           resources:
             limits:
-              cpu: 500m
-              memory: 1Gi
+              memory: 5Gi
             requests:
               cpu: 100m
               memory: 512Mi
