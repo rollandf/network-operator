@@ -82,6 +82,10 @@ func migrate(ctx context.Context, log logr.Logger, c client.Client) error {
 		log.V(consts.LogLevelError).Error(err, "error trying to handle single MOFED DS")
 		return err
 	}
+	if err := handleMissingDSOwnerLabelOnPods(ctx, log, c); err != nil {
+		log.V(consts.LogLevelError).Error(err, "error trying to backfill ds-owner label on OFED pods")
+		return err
+	}
 	if err := handleWhereaboutsObj(ctx, log, c); err != nil {
 		log.V(consts.LogLevelError).Error(err, "error trying to update Whereabouts resources")
 		return err
@@ -180,6 +184,51 @@ func getDaemonSetNodes(ctx context.Context, c client.Client, ds *appsv1.DaemonSe
 		}
 	}
 	return nodeNames, nil
+}
+
+// handleMissingDSOwnerLabelOnPods backfills the ds-owner label on OFED pods that are missing it.
+// This handles the upgrade path from releases where ds-owner was not yet part of the pod template
+// (e.g. v26.1 GA) to releases where it is (v26.4+). Without the label, BuildState in the upgrade
+// controller cannot match pods to their DaemonSet and the upgrade stalls permanently.
+// The function is a no-op when all OFED pods already carry the label.
+func handleMissingDSOwnerLabelOnPods(ctx context.Context, log logr.Logger, c client.Client) error {
+	ncp := &mellanoxv1alpha1.NicClusterPolicy{}
+	key := types.NamespacedName{Name: consts.NicClusterPolicyResourceName}
+	if err := c.Get(ctx, key, ncp); err != nil {
+		if apiErrors.IsNotFound(err) {
+			log.V(consts.LogLevelDebug).Info("NicClusterPolicy not found, skip backfilling ds-owner label on OFED pods")
+			return nil
+		}
+		return err
+	}
+	if ncp.Spec.OFEDDriver == nil {
+		return nil
+	}
+
+	podList := &corev1.PodList{}
+	if err := c.List(ctx, podList,
+		client.InNamespace(config.FromEnv().State.NetworkOperatorResourceNamespace),
+		client.MatchingLabels{consts.OfedDriverLabel: ""}); err != nil {
+		return err
+	}
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if _, ok := pod.Labels[consts.DSOwnerLabel]; ok {
+			continue
+		}
+		patch := client.MergeFrom(pod.DeepCopy())
+		pod.Labels[consts.DSOwnerLabel] = mellanoxv1alpha1.NicClusterPolicyCRDName
+		if err := c.Patch(ctx, pod, patch); err != nil {
+			if apiErrors.IsNotFound(err) {
+				log.V(consts.LogLevelDebug).Info("OFED pod deleted during backfill, skipping", "pod", pod.Name)
+				continue
+			}
+			return err
+		}
+		log.V(consts.LogLevelInfo).Info("Backfilled ds-owner label on OFED pod", "pod", pod.Name)
+	}
+	return nil
 }
 
 func handleWhereaboutsObj(ctx context.Context, log logr.Logger, c client.Client) error {
