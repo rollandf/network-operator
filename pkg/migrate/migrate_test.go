@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -42,6 +43,9 @@ var _ = Describe("Migrate", func() {
 		_ = k8sClient.Delete(goctx.Background(), cm)
 		_ = k8sClient.DeleteAllOf(goctx.Background(), &corev1.Node{})
 		_ = k8sClient.DeleteAllOf(goctx.Background(), &corev1.Pod{})
+		_ = k8sClient.Delete(goctx.Background(), &mellanoxv1alpha1.NicClusterPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: consts.NicClusterPolicyResourceName},
+		})
 	})
 	It("should delete MOFED DS", func() {
 		upgrade.SetDriverName("ofed")
@@ -162,6 +166,183 @@ func createPods() {
 	}
 	err = k8sClient.Create(goctx.TODO(), pod2)
 	Expect(err).NotTo(HaveOccurred())
+}
+
+var _ = Describe("handleMissingDSOwnerLabelOnPods", func() {
+	var ncp *mellanoxv1alpha1.NicClusterPolicy
+
+	BeforeEach(func() {
+		ncp = &mellanoxv1alpha1.NicClusterPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: consts.NicClusterPolicyResourceName},
+			Spec: mellanoxv1alpha1.NicClusterPolicySpec{
+				OFEDDriver: &mellanoxv1alpha1.OFEDDriverSpec{
+					ImageSpec: mellanoxv1alpha1.ImageSpec{
+						Image:      "mofed",
+						Repository: "nvcr.io/nvidia/mellanox",
+						Version:    "5.9-0.5.6.0",
+					},
+				},
+			},
+		}
+	})
+
+	AfterEach(func() {
+		_ = k8sClient.DeleteAllOf(goctx.Background(), &corev1.Pod{}, client.InNamespace(namespaceName))
+		if ncp != nil {
+			_ = k8sClient.Delete(goctx.Background(), ncp)
+		}
+	})
+
+	It("should backfill ds-owner on old OFED pods that lack the label", func() {
+		Expect(k8sClient.Create(goctx.Background(), ncp)).To(Succeed())
+
+		pod := ofedPodWithoutDSOwner("old-pod-1")
+		Expect(k8sClient.Create(goctx.Background(), pod)).To(Succeed())
+
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "old-pod-1"}, updated)).To(Succeed())
+		Expect(updated.Labels[consts.DSOwnerLabel]).To(Equal(mellanoxv1alpha1.NicClusterPolicyCRDName))
+	})
+
+	It("should be a no-op when pods already have the ds-owner label", func() {
+		Expect(k8sClient.Create(goctx.Background(), ncp)).To(Succeed())
+
+		pod := ofedPodWithoutDSOwner("new-pod-1")
+		pod.Labels[consts.DSOwnerLabel] = mellanoxv1alpha1.NicClusterPolicyCRDName
+		Expect(k8sClient.Create(goctx.Background(), pod)).To(Succeed())
+
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "new-pod-1"}, updated)).To(Succeed())
+		Expect(updated.Labels[consts.DSOwnerLabel]).To(Equal(mellanoxv1alpha1.NicClusterPolicyCRDName))
+	})
+
+	It("should not touch NNP pods that already have a different ds-owner value", func() {
+		Expect(k8sClient.Create(goctx.Background(), ncp)).To(Succeed())
+
+		pod := ofedPodWithoutDSOwner("nnp-pod-1")
+		pod.Labels[consts.DSOwnerLabel] = "nnp-my-policy"
+		Expect(k8sClient.Create(goctx.Background(), pod)).To(Succeed())
+
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "nnp-pod-1"}, updated)).To(Succeed())
+		Expect(updated.Labels[consts.DSOwnerLabel]).To(Equal("nnp-my-policy"))
+	})
+
+	It("should be a no-op when NicClusterPolicy does not exist", func() {
+		ncp = nil
+		pod := ofedPodWithoutDSOwner("orphan-pod-1")
+		Expect(k8sClient.Create(goctx.Background(), pod)).To(Succeed())
+
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "orphan-pod-1"}, updated)).To(Succeed())
+		_, hasLabel := updated.Labels[consts.DSOwnerLabel]
+		Expect(hasLabel).To(BeFalse())
+	})
+
+	It("should only patch pods missing ds-owner when old and new pods coexist", func() {
+		Expect(k8sClient.Create(goctx.Background(), ncp)).To(Succeed())
+
+		// Simulates the real upgrade scenario: one old pod (no ds-owner) and one already-labeled pod.
+		oldPod := ofedPodWithoutDSOwner("mixed-old-pod")
+		Expect(k8sClient.Create(goctx.Background(), oldPod)).To(Succeed())
+
+		newPod := ofedPodWithoutDSOwner("mixed-new-pod")
+		newPod.Labels[consts.DSOwnerLabel] = mellanoxv1alpha1.NicClusterPolicyCRDName
+		Expect(k8sClient.Create(goctx.Background(), newPod)).To(Succeed())
+
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Old pod must now have the label.
+		updatedOld := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "mixed-old-pod"}, updatedOld)).To(Succeed())
+		Expect(updatedOld.Labels[consts.DSOwnerLabel]).To(Equal(mellanoxv1alpha1.NicClusterPolicyCRDName))
+
+		// Already-labeled pod must be unchanged (same value, not overwritten).
+		updatedNew := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "mixed-new-pod"}, updatedNew)).To(Succeed())
+		Expect(updatedNew.Labels[consts.DSOwnerLabel]).To(Equal(mellanoxv1alpha1.NicClusterPolicyCRDName))
+		Expect(updatedNew.ResourceVersion).To(Equal(newPod.ResourceVersion),
+			"already-labeled pod should not have been patched (ResourceVersion unchanged)")
+	})
+
+	It("should skip a pod that is deleted between List and Patch without failing", func() {
+		Expect(k8sClient.Create(goctx.Background(), ncp)).To(Succeed())
+
+		// Create one pod that will be deleted before the patch, and one that should survive.
+		podToDelete := ofedPodWithoutDSOwner("deleted-pod-1")
+		Expect(k8sClient.Create(goctx.Background(), podToDelete)).To(Succeed())
+		podToKeep := ofedPodWithoutDSOwner("kept-pod-1")
+		Expect(k8sClient.Create(goctx.Background(), podToKeep)).To(Succeed())
+
+		// Delete the first pod to simulate it disappearing between List and Patch.
+		Expect(k8sClient.Delete(goctx.Background(), podToDelete)).To(Succeed())
+
+		// Migration must not fail and must still patch the surviving pod.
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "kept-pod-1"}, updated)).To(Succeed())
+		Expect(updated.Labels[consts.DSOwnerLabel]).To(Equal(mellanoxv1alpha1.NicClusterPolicyCRDName))
+	})
+
+	It("should be a no-op when NicClusterPolicy has no OFED driver configured", func() {
+		ncp.Spec.OFEDDriver = nil
+		Expect(k8sClient.Create(goctx.Background(), ncp)).To(Succeed())
+
+		pod := ofedPodWithoutDSOwner("no-ofed-pod-1")
+		Expect(k8sClient.Create(goctx.Background(), pod)).To(Succeed())
+
+		err := handleMissingDSOwnerLabelOnPods(goctx.Background(), testLog, k8sClient)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &corev1.Pod{}
+		Expect(k8sClient.Get(goctx.Background(),
+			types.NamespacedName{Namespace: namespaceName, Name: "no-ofed-pod-1"}, updated)).To(Succeed())
+		_, hasLabel := updated.Labels[consts.DSOwnerLabel]
+		Expect(hasLabel).To(BeFalse())
+	})
+})
+
+// ofedPodWithoutDSOwner creates a pod spec that mimics a v26.1 GA MOFED pod:
+// it has the nvidia.com/ofed-driver label but no ds-owner label.
+func ofedPodWithoutDSOwner(name string) *corev1.Pod {
+	gracePeriod := int64(0)
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespaceName,
+			Labels: map[string]string{
+				consts.OfedDriverLabel: "",
+			},
+		},
+		Spec: corev1.PodSpec{
+			TerminationGracePeriodSeconds: &gracePeriod,
+			Containers: []corev1.Container{
+				{Name: "mofed-container", Image: "nvcr.io/nvidia/mellanox/doca-driver:test"},
+			},
+		},
+	}
 }
 
 func createNCP() {
