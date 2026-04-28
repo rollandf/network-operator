@@ -100,7 +100,7 @@ spec:
             path: /sys
         - name: ovs
           hostPath:
-            path: /host/run/openvswitch/
+            path: /var/run/openvswitch/
         - name: ovs-systemd-config
           hostPath:
             path: /etc/default/openvswitch-switch
